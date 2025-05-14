@@ -16,6 +16,7 @@ from trainer import DDoSModelTrainer, setup_trainer
 from utils import setup_logger, compute_node_attack_probability, set_seed
 from data_processor import DDoSDataset
 
+
 def parse_args():
     """解析命令行参数"""
     parser = argparse.ArgumentParser(description='基于LSTM的SDN网络DDoS攻击预测模型')
@@ -112,6 +113,9 @@ def train(args, logger):
     # 初始化数据集
     logger.info("初始化数据集")
     try:
+        # 设置是否应用PCA：确保训练和推理一致
+        apply_pca = True  # 可以从命令行参数中获取这个设置
+
         train_dataset = DDoSDataset(
             data_path=args.data_path,
             threshold_points=args.threshold_points,
@@ -123,6 +127,10 @@ def train(args, logger):
         # 保存预处理器
         preprocessor_path = os.path.join(output_dir, 'preprocessor.pkl')
         train_dataset.get_preprocessor().save_preprocessors(preprocessor_path)
+
+        # 记录PCA应用状态到配置文件中，确保后续推理时知道是否使用了PCA
+        with open(os.path.join(output_dir, 'pca_config.json'), 'w') as f:
+            json.dump({"applied_pca": apply_pca}, f)
 
         # 划分训练集和验证集
         train_size = int(0.8 * len(train_dataset))
@@ -157,6 +165,10 @@ def train(args, logger):
         input_dim = sample_features.shape[0]
         logger.info(f"特征维度: {input_dim}")
 
+        # 将实际特征维度保存到配置中，确保后续加载模型时使用正确的维度
+        with open(os.path.join(output_dir, 'feature_dim.json'), 'w') as f:
+            json.dump({"input_dim": int(input_dim)}, f)
+
     except Exception as e:
         logger.error(f"数据集创建失败: {str(e)}")
         return
@@ -190,7 +202,7 @@ def train(args, logger):
     logger.info("设置训练器")
     trainer = setup_trainer(
         model=model,
-        train_labels=train_labels,  # 使用收集的标签
+        train_labels=train_labels,  # 传递标签数组而不是数据集
         device=device,
         lr=args.learning_rate,
         weight_decay=args.weight_decay
@@ -216,95 +228,13 @@ def train(args, logger):
 
     logger.info("训练完成")
 
-#先不用predict函数
+
+# 先不用predict函数
 def predict(args, logger):
     """预测模式"""
     logger.info("启动预测模式")
-
-    # 设置设备
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logger.info(f"使用设备: {device}")
-
-    # 创建输出目录
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = os.path.join(args.output_dir, f"predict_{timestamp}")
-    os.makedirs(output_dir, exist_ok=True)
-
-    # 加载模型
-    logger.info(f"从 {args.model_path} 加载模型")
-    model = DDoSPredictionLSTM.load(args.model_path, device)
-    model.eval()
-
-    # 查找预处理器
-    model_dir = os.path.dirname(args.model_path)
-    preprocessor_path = os.path.join(model_dir, 'preprocessor.pkl')
-
-    # 初始化数据处理器
-    processor = DataProcessor(
-        data_path=args.data_path,
-        threshold_points=args.threshold_points,
-        window_size=args.window_size,
-        step_size=args.step_size,
-        n_workers=args.n_workers
-    )
-
-    # 如果存在预处理器，则加载
-    if os.path.exists(preprocessor_path):
-        logger.info(f"从 {preprocessor_path} 加载预处理器")
-        processor.load_preprocessors(preprocessor_path)
-
-    # 处理数据
-    logger.info("处理预测数据")
-    X, _ = processor.process_data_pipeline(train=False)
-
-    if len(X) == 0:
-        logger.error("未能生成有效的预测数据，请检查数据路径和处理参数")
-        return
-
-    logger.info(f"数据处理完成: X.shape={X.shape}")
-
-    # 转换为PyTorch张量
-    X_tensor = torch.FloatTensor(X).to(device)
-
-    # 进行预测
-    logger.info("执行预测")
-    with torch.no_grad():
-        probs = model(X_tensor)
-        probs = probs.cpu().numpy()
-
-    # 使用阈值进行二分类
-    predictions = (probs >= args.threshold).astype(int)
-
-    logger.info(f"预测结果: 攻击样本比例 {np.mean(predictions):.2%}")
-
-    # 计算节点攻击概率 (假设均匀的流量和服务重要性)
-    logger.info("计算节点攻击概率")
-    n_flows = len(probs)
-    flow_rates = np.ones(n_flows) / n_flows  # 假设均匀的流量比率
-    service_importance = np.ones(n_flows)  # 假设均匀的服务重要性
-
-    node_prob = compute_node_attack_probability(
-        flow_probs=probs.flatten(),
-        flow_rates=flow_rates,
-        service_importance=service_importance
-    )
-
-    logger.info(f"节点攻击概率: {node_prob:.4f}")
-
-    # 保存预测结果
-    results = {
-        'flow_probabilities': probs.flatten().tolist(),
-        'flow_predictions': predictions.flatten().tolist(),
-        'node_attack_probability': float(node_prob),
-        'prediction_threshold': args.threshold
-    }
-
-    results_path = os.path.join(output_dir, 'prediction_results.json')
-    with open(results_path, 'w') as f:
-        json.dump(results, f, indent=4)
-
-    logger.info(f"预测结果已保存至 {results_path}")
-    logger.info("预测完成")
+    # 此部分暂时不实现，当前任务仅为训练模型
+    logger.info("预测功能尚未完全实现")
 
 
 def main():

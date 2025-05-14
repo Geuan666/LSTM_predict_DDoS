@@ -459,7 +459,7 @@ class DDoSModelTrainer:
 
 
 def setup_trainer(model: nn.Module,
-                  train_dataset: torch.utils.data.Dataset,  # 修改：使用Dataset而不是labels数组
+                  train_labels: np.ndarray,  # 修改：使用np.ndarray而不是Dataset
                   device: torch.device,
                   lr: float = 0.001,
                   weight_decay: float = 0.001) -> DDoSModelTrainer:
@@ -468,7 +468,7 @@ def setup_trainer(model: nn.Module,
 
     Args:
         model: 模型实例
-        train_dataset: 训练数据集，用于计算类别权重
+        train_labels: 训练标签数组，用于计算类别权重
         device: 设备(CPU/GPU)
         lr: 学习率
         weight_decay: 权重衰减(L2正则化)
@@ -476,12 +476,6 @@ def setup_trainer(model: nn.Module,
     Returns:
         配置好的训练器实例
     """
-    # 计算类别权重 - 从数据集中获取所有标签
-    all_labels = []
-    for _, y in train_dataset:
-        all_labels.append(y.numpy())
-    train_labels = np.concatenate(all_labels)
-
     # 创建损失函数
     loss_fn = create_loss_function(train_labels)
 
@@ -533,7 +527,7 @@ if __name__ == "__main__":
     )
 
     # 设置训练器
-    trainer = setup_trainer(model, y_train, device)
+    trainer = setup_trainer(model, y_train, device)  # 修改这里，直接传递y_train
 
     # 进行训练（简短的）
     trainer.fit(train_loader, val_loader, epochs=2)
