@@ -1,0 +1,323 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+import os
+import logging
+import argparse
+import numpy as np
+import torch
+import json
+from datetime import datetime
+from typing import Dict, List
+
+from data_processor import DataProcessor
+from lstm_model import DDoSPredictionLSTM
+from trainer import DDoSModelTrainer, setup_trainer
+from utils import setup_logger, compute_node_attack_probability, set_seed
+
+
+def parse_args():
+    """解析命令行参数"""
+    parser = argparse.ArgumentParser(description='基于LSTM的SDN网络DDoS攻击预测模型')
+
+    # 基本参数
+    parser.add_argument('--mode', type=str, default='train', choices=['train', 'predict'],
+                        help='运行模式: train(训练) 或 predict(预测)')
+    parser.add_argument('--data_path', type=str, required=True,
+                        help='数据文件或目录路径')
+    parser.add_argument('--output_dir', type=str, default='output',
+                        help='输出目录路径')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='随机种子')
+
+    # 训练相关参数
+    parser.add_argument('--epochs', type=int, default=50,
+                        help='训练轮数')
+    parser.add_argument('--batch_size', type=int, default=64,
+                        help='批处理大小')
+    parser.add_argument('--learning_rate', type=float, default=0.001,
+                        help='学习率')
+    parser.add_argument('--weight_decay', type=float, default=0.001,
+                        help='权重衰减(L2正则化)')
+    parser.add_argument('--early_stopping', action='store_true',
+                        help='是否启用早停')
+    parser.add_argument('--accumulation_steps', type=int, default=4,
+                        help='梯度累积步数')
+
+    # 模型相关参数
+    parser.add_argument('--model_path', type=str, default=None,
+                        help='模型路径(预测模式必需，训练模式下为权重加载路径)')
+    parser.add_argument('--input_dim', type=int, default=128,
+                        help='输入特征维度')
+    parser.add_argument('--embedding_dim', type=int, default=32,
+                        help='嵌入维度')
+    parser.add_argument('--hidden_dim', type=int, default=64,
+                        help='LSTM隐藏层维度')
+    parser.add_argument('--num_layers', type=int, default=2,
+                        help='LSTM层数')
+    parser.add_argument('--dropout', type=float, default=0.3,
+                        help='Dropout率')
+    parser.add_argument('--attention_heads', type=int, default=4,
+                        help='注意力头数')
+
+    # 数据处理相关参数
+    parser.add_argument('--threshold_points', type=str, default='4,8,16,32,64,128',
+                        help='阈值点列表，以逗号分隔')
+    parser.add_argument('--window_size', type=int, default=15,
+                        help='滑动窗口大小(秒)')
+    parser.add_argument('--step_size', type=int, default=1,
+                        help='滑动步长(秒)')
+    parser.add_argument('--n_workers', type=int, default=4,
+                        help='并行处理的工作进程数')
+
+    # 预测相关参数
+    parser.add_argument('--threshold', type=float, default=0.5,
+                        help='攻击判定阈值')
+
+    args = parser.parse_args()
+
+    # 转换阈值点字符串为列表
+    args.threshold_points = [int(x) for x in args.threshold_points.split(',')]
+
+    # 检查预测模式必需参数
+    if args.mode == 'predict' and args.model_path is None:
+        parser.error("预测模式需要指定 --model_path")
+
+    return args
+
+
+def train(args, logger):
+    """训练模式"""
+    logger.info("启动训练模式")
+
+    # 设置随机种子
+    set_seed(args.seed)
+
+    # 设置设备
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    logger.info(f"使用设备: {device}")
+
+    # 创建输出目录
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = os.path.join(args.output_dir, f"train_{timestamp}")
+    os.makedirs(output_dir, exist_ok=True)
+    checkpoint_dir = os.path.join(output_dir, 'checkpoints')
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    logger.info(f"输出目录: {output_dir}")
+
+    # 保存训练参数
+    with open(os.path.join(output_dir, 'config.json'), 'w') as f:
+        json.dump(vars(args), f, indent=4)
+
+    # 初始化数据处理器
+    logger.info("初始化数据处理器")
+    processor = DataProcessor(
+        data_path=args.data_path,
+        threshold_points=args.threshold_points,
+        window_size=args.window_size,
+        step_size=args.step_size,
+        n_workers=args.n_workers
+    )
+
+    # 处理数据
+    logger.info("开始数据处理流水线")
+    X, y = processor.process_data_pipeline(train=True)
+
+    if len(X) == 0 or len(y) == 0:
+        logger.error("未能生成有效的训练数据，请检查数据路径和处理参数")
+        return
+
+    logger.info(f"数据处理完成: X.shape={X.shape}, y.shape={y.shape}")
+
+    # 保存预处理器
+    preprocessor_path = os.path.join(output_dir, 'preprocessor.pkl')
+    processor.save_preprocessors(preprocessor_path)
+
+    # 创建模型
+    logger.info("创建模型")
+    model = DDoSPredictionLSTM(
+        input_dim=args.input_dim,
+        embedding_dim=args.embedding_dim,
+        hidden_dim=args.hidden_dim,
+        num_layers=args.num_layers,
+        dropout=args.dropout,
+        attention_heads=args.attention_heads,
+        attention_dim=args.hidden_dim,
+        threshold_points=len(args.threshold_points)
+    ).to(device)
+
+    # 如果指定了模型路径，则加载权重
+    if args.model_path and os.path.exists(args.model_path):
+        logger.info(f"从 {args.model_path} 加载模型权重")
+        loaded_model = DDoSPredictionLSTM.load(args.model_path, device)
+        model.load_state_dict(loaded_model.state_dict())
+
+    # 划分训练集和验证集 (80/20)
+    from sklearn.model_selection import train_test_split
+    X_train, X_val, y_train, y_val = train_test_split(
+        X, y, test_size=0.2, random_state=args.seed, stratify=y
+    )
+    logger.info(f"训练集: {X_train.shape}, 验证集: {X_val.shape}")
+
+    # 创建数据加载器
+    train_loader, val_loader = DDoSModelTrainer.prepare_data_loaders(
+        X_train, y_train, X_val, y_val, batch_size=args.batch_size
+    )
+
+    # 设置训练器
+    logger.info("设置训练器")
+    trainer = setup_trainer(
+        model=model,
+        train_labels=y_train,
+        device=device,
+        lr=args.learning_rate,
+        weight_decay=args.weight_decay
+    )
+
+    # 设置检查点目录
+    trainer.checkpoint_dir = checkpoint_dir
+
+    # 开始训练
+    logger.info("开始训练")
+    history = trainer.fit(
+        train_loader=train_loader,
+        val_loader=val_loader,
+        epochs=args.epochs,
+        accumulation_steps=args.accumulation_steps,
+        early_stopping=args.early_stopping
+    )
+
+    # 保存最终模型
+    final_model_path = os.path.join(output_dir, 'final_model.pt')
+    model.save(final_model_path)
+    logger.info(f"最终模型已保存至 {final_model_path}")
+
+    logger.info("训练完成")
+
+
+def predict(args, logger):
+    """预测模式"""
+    logger.info("启动预测模式")
+
+    # 设置设备
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    logger.info(f"使用设备: {device}")
+
+    # 创建输出目录
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = os.path.join(args.output_dir, f"predict_{timestamp}")
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 加载模型
+    logger.info(f"从 {args.model_path} 加载模型")
+    model = DDoSPredictionLSTM.load(args.model_path, device)
+    model.eval()
+
+    # 查找预处理器
+    model_dir = os.path.dirname(args.model_path)
+    preprocessor_path = os.path.join(model_dir, 'preprocessor.pkl')
+
+    # 初始化数据处理器
+    processor = DataProcessor(
+        data_path=args.data_path,
+        threshold_points=args.threshold_points,
+        window_size=args.window_size,
+        step_size=args.step_size,
+        n_workers=args.n_workers
+    )
+
+    # 如果存在预处理器，则加载
+    if os.path.exists(preprocessor_path):
+        logger.info(f"从 {preprocessor_path} 加载预处理器")
+        processor.load_preprocessors(preprocessor_path)
+
+    # 处理数据
+    logger.info("处理预测数据")
+    X, _ = processor.process_data_pipeline(train=False)
+
+    if len(X) == 0:
+        logger.error("未能生成有效的预测数据，请检查数据路径和处理参数")
+        return
+
+    logger.info(f"数据处理完成: X.shape={X.shape}")
+
+    # 转换为PyTorch张量
+    X_tensor = torch.FloatTensor(X).to(device)
+
+    # 进行预测
+    logger.info("执行预测")
+    with torch.no_grad():
+        probs = model(X_tensor)
+        probs = probs.cpu().numpy()
+
+    # 使用阈值进行二分类
+    predictions = (probs >= args.threshold).astype(int)
+
+    logger.info(f"预测结果: 攻击样本比例 {np.mean(predictions):.2%}")
+
+    # 计算节点攻击概率 (假设均匀的流量和服务重要性)
+    logger.info("计算节点攻击概率")
+    n_flows = len(probs)
+    flow_rates = np.ones(n_flows) / n_flows  # 假设均匀的流量比率
+    service_importance = np.ones(n_flows)  # 假设均匀的服务重要性
+
+    node_prob = compute_node_attack_probability(
+        flow_probs=probs.flatten(),
+        flow_rates=flow_rates,
+        service_importance=service_importance
+    )
+
+    logger.info(f"节点攻击概率: {node_prob:.4f}")
+
+    # 保存预测结果
+    results = {
+        'flow_probabilities': probs.flatten().tolist(),
+        'flow_predictions': predictions.flatten().tolist(),
+        'node_attack_probability': float(node_prob),
+        'prediction_threshold': args.threshold
+    }
+
+    results_path = os.path.join(output_dir, 'prediction_results.json')
+    with open(results_path, 'w') as f:
+        json.dump(results, f, indent=4)
+
+    logger.info(f"预测结果已保存至 {results_path}")
+    logger.info("预测完成")
+
+
+def main():
+    """主程序入口"""
+    # 解析命令行参数
+    args = parse_args()
+
+    # 创建输出目录
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # 设置日志
+    log_dir = os.path.join(args.output_dir, 'logs')
+    os.makedirs(log_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = os.path.join(log_dir, f"{args.mode}_{timestamp}.log")
+
+    logger = setup_logger(name="SDN_DDoS_Predictor", log_file=log_file)
+
+    # 记录启动信息
+    logger.info(f"SDN网络DDoS攻击预测模型 - 模式: {args.mode}")
+    logger.info(f"命令行参数: {vars(args)}")
+
+    try:
+        # 根据模式执行对应功能
+        if args.mode == 'train':
+            train(args, logger)
+        elif args.mode == 'predict':
+            predict(args, logger)
+        else:
+            logger.error(f"不支持的模式: {args.mode}")
+    except Exception as e:
+        logger.exception(f"运行时错误: {str(e)}")
+        raise
+
+    logger.info("程序执行完毕")
+
+
+if __name__ == "__main__":
+    main()
