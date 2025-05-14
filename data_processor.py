@@ -11,14 +11,18 @@ from sklearn.decomposition import PCA
 from collections import defaultdict
 import pickle
 import warnings
+import torch
+from torch.utils.data import Dataset
 
 warnings.filterwarnings('ignore')
 logger = logging.getLogger(__name__)
+
 
 class DataProcessor:
     """
     数据处理类，负责加载、清洗、特征工程及阈值式序列构建
     """
+
     def __init__(self,
                  data_path: str,
                  threshold_points: List[int] = [4, 8, 16, 32, 64, 128],
@@ -365,16 +369,10 @@ class DataProcessor:
         # 标签列，如果存在
         label_col = 'Label' if 'Label' in df.columns else None
 
-        # 并行处理各阈值点
-        with mp.Pool(self.n_workers) as pool:
-            results = pool.starmap(
-                self._process_threshold_point,
-                [(df, threshold, feature_cols, label_col) for threshold in self.threshold_points]
-            )
-
-        # 合并结果
-        for threshold, data in zip(self.threshold_points, results):
-            threshold_sequences[threshold] = data
+        # 处理各阈值点 - 修改为串行处理而不是使用multiprocessing
+        for threshold in self.threshold_points:
+            result = self._process_threshold_point(df, threshold, feature_cols, label_col)
+            threshold_sequences[threshold] = result
 
         logger.info("阈值式序列构建完成")
         return threshold_sequences
@@ -440,7 +438,7 @@ class DataProcessor:
         all_window_data = []
         all_window_labels = []
 
-        # 对每个阈值点的序列进行处理
+        # 对每个阈值点的序列进行处理 - 不再使用并行处理
         for threshold, data in threshold_sequences.items():
             if data.size == 0:
                 continue
@@ -453,24 +451,12 @@ class DataProcessor:
                 logger.warning(f"阈值点 {threshold} 的数据没有标签列")
                 continue
 
-            # 创建并行处理任务
-            chunk_size = max(1, len(X) // self.n_workers)
-            chunks = [(X[i:i + chunk_size], y[i:i + chunk_size], i)
-                      for i in range(0, len(X), chunk_size)]
+            # 创建窗口
+            x_windows, y_windows = self._create_windows_chunk(X, y, self.window_size, self.step_size, 0)
 
-            # 并行创建窗口
-            with mp.Pool(self.n_workers) as pool:
-                results = pool.starmap(
-                    self._create_windows_chunk,
-                    [(x_chunk, y_chunk, self.window_size, self.step_size, chunk_idx)
-                     for x_chunk, y_chunk, chunk_idx in chunks]
-                )
-
-            # 合并结果
-            for x_windows, y_windows in results:
-                if x_windows is not None and y_windows is not None:
-                    all_window_data.append(x_windows)
-                    all_window_labels.append(y_windows)
+            if x_windows is not None and y_windows is not None:
+                all_window_data.append(x_windows)
+                all_window_labels.append(y_windows)
 
         # 合并所有阈值点的窗口数据
         if all_window_data and all_window_labels:
@@ -600,6 +586,75 @@ class DataProcessor:
         logger.info(f"预处理器已从 {load_path} 加载")
 
 
+class DDoSDataset(Dataset):
+    """
+    DDoS攻击预测的PyTorch数据集类
+    """
+
+    def __init__(self,
+                 data_path: str,
+                 threshold_points: List[int] = [4, 8, 16, 32, 64, 128],
+                 window_size: int = 15,
+                 step_size: int = 1,
+                 preprocessor_path: Optional[str] = None,
+                 train: bool = True,
+                 transform: Optional[Any] = None):
+        """
+        初始化数据集
+
+        Args:
+            data_path: 数据文件路径
+            threshold_points: 阈值点列表
+            window_size: 窗口大小
+            step_size: 滑动步长
+            preprocessor_path: 预处理器路径（用于加载已保存的预处理器）
+            train: 是否为训练模式
+            transform: 数据转换函数
+        """
+        self.transform = transform
+
+        # 初始化处理器（单进程模式，数据集内部处理不需要并行）
+        self.processor = DataProcessor(
+            data_path=data_path,
+            threshold_points=threshold_points,
+            window_size=window_size,
+            step_size=step_size,
+            n_workers=1  # 单进程处理
+        )
+
+        # 如果有预处理器路径且不是训练模式，加载预处理器
+        if preprocessor_path and not train:
+            self.processor.load_preprocessors(preprocessor_path)
+
+        # 处理数据
+        self.features, self.labels = self.processor.process_data_pipeline(train=train)
+
+        # 转换为PyTorch张量
+        if len(self.features) > 0 and len(self.labels) > 0:
+            self.features = torch.FloatTensor(self.features)
+            self.labels = torch.FloatTensor(self.labels).unsqueeze(1)
+        else:
+            raise ValueError("处理数据失败，未能生成有效的特征和标签")
+
+    def __len__(self):
+        """返回数据集长度"""
+        return len(self.features)
+
+    def __getitem__(self, idx):
+        """获取单个样本"""
+        x = self.features[idx]
+        y = self.labels[idx]
+
+        if self.transform:
+            x = self.transform(x)
+
+        return x, y
+
+    def get_preprocessor(self):
+        """获取预处理器"""
+        return self.processor
+
+
 # 测试用例
 if __name__ == "__main__":
     # 配置日志
@@ -627,5 +682,18 @@ if __name__ == "__main__":
         print(f"标签数据形状: {y.shape}")
         print(f"攻击样本比例: {np.mean(y):.2%}")
 
-    # 保存预处理器
-    #processor.save_preprocessors("models/preprocessors.pkl")
+    # 测试PyTorch数据集
+    try:
+        dataset = DDoSDataset(
+            data_path=data_path,
+            threshold_points=[4, 8, 16, 32, 64, 128],
+            window_size=15,
+            step_size=1,
+            train=True
+        )
+        print(f"数据集大小: {len(dataset)}")
+        x, y = dataset[0]
+        print(f"样本特征形状: {x.shape}")
+        print(f"样本标签形状: {y.shape}")
+    except Exception as e:
+        print(f"数据集测试失败: {str(e)}")

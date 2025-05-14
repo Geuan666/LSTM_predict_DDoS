@@ -186,12 +186,12 @@ class DDoSPredictionLSTM(nn.Module):
         # 特征嵌入层
         self.embedding = nn.Sequential(
             nn.Linear(input_dim, embedding_dim),
-            nn.BatchNorm1d(threshold_points),
+            nn.BatchNorm1d(embedding_dim),
             nn.ReLU()
         )
 
         # 位置编码
-        self.positional_encoding = PositionalEncoding(embedding_dim, max_len=threshold_points)
+        self.positional_encoding = PositionalEncoding(embedding_dim, max_len=max(10, threshold_points))
 
         # 双向LSTM层
         self.lstm = nn.LSTM(
