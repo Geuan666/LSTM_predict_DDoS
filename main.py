@@ -8,12 +8,13 @@ import torch
 import json
 from datetime import datetime
 from typing import Dict, List
+from torch.utils.data import DataLoader, random_split
 
 from data_processor import DataProcessor
 from lstm_model import DDoSPredictionLSTM
 from trainer import DDoSModelTrainer, setup_trainer
 from utils import setup_logger, compute_node_attack_probability, set_seed
-
+from data_processor import DDoSDataset
 
 def parse_args():
     """解析命令行参数"""
@@ -108,34 +109,62 @@ def train(args, logger):
     with open(os.path.join(output_dir, 'config.json'), 'w') as f:
         json.dump(vars(args), f, indent=4)
 
-    # 初始化数据处理器
-    logger.info("初始化数据处理器")
-    processor = DataProcessor(
-        data_path=args.data_path,
-        threshold_points=args.threshold_points,
-        window_size=args.window_size,
-        step_size=args.step_size,
-        n_workers=args.n_workers
-    )
+    # 初始化数据集
+    logger.info("初始化数据集")
+    try:
+        train_dataset = DDoSDataset(
+            data_path=args.data_path,
+            threshold_points=args.threshold_points,
+            window_size=args.window_size,
+            step_size=args.step_size,
+            train=True
+        )
 
-    # 处理数据
-    logger.info("开始数据处理流水线")
-    X, y = processor.process_data_pipeline(train=True)
+        # 保存预处理器
+        preprocessor_path = os.path.join(output_dir, 'preprocessor.pkl')
+        train_dataset.get_preprocessor().save_preprocessors(preprocessor_path)
 
-    if len(X) == 0 or len(y) == 0:
-        logger.error("未能生成有效的训练数据，请检查数据路径和处理参数")
+        # 划分训练集和验证集
+        train_size = int(0.8 * len(train_dataset))
+        val_size = len(train_dataset) - train_size
+        train_subset, val_subset = random_split(
+            train_dataset,
+            [train_size, val_size],
+            generator=torch.Generator().manual_seed(args.seed)
+        )
+
+        logger.info(f"数据集大小: {len(train_dataset)}, 训练集: {len(train_subset)}, 验证集: {len(val_subset)}")
+
+        # 创建数据加载器
+        train_loader = DataLoader(
+            train_subset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.n_workers,
+            pin_memory=torch.cuda.is_available()
+        )
+
+        val_loader = DataLoader(
+            val_subset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.n_workers,
+            pin_memory=torch.cuda.is_available()
+        )
+
+        # 计算特征维度
+        sample_features, _ = train_dataset[0]
+        input_dim = sample_features.shape[0]
+        logger.info(f"特征维度: {input_dim}")
+
+    except Exception as e:
+        logger.error(f"数据集创建失败: {str(e)}")
         return
-
-    logger.info(f"数据处理完成: X.shape={X.shape}, y.shape={y.shape}")
-
-    # 保存预处理器
-    preprocessor_path = os.path.join(output_dir, 'preprocessor.pkl')
-    processor.save_preprocessors(preprocessor_path)
 
     # 创建模型
     logger.info("创建模型")
     model = DDoSPredictionLSTM(
-        input_dim=args.input_dim,
+        input_dim=input_dim,  # 使用实际特征维度
         embedding_dim=args.embedding_dim,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
@@ -151,23 +180,17 @@ def train(args, logger):
         loaded_model = DDoSPredictionLSTM.load(args.model_path, device)
         model.load_state_dict(loaded_model.state_dict())
 
-    # 划分训练集和验证集 (80/20)
-    from sklearn.model_selection import train_test_split
-    X_train, X_val, y_train, y_val = train_test_split(
-        X, y, test_size=0.2, random_state=args.seed, stratify=y
-    )
-    logger.info(f"训练集: {X_train.shape}, 验证集: {X_val.shape}")
-
-    # 创建数据加载器
-    train_loader, val_loader = DDoSModelTrainer.prepare_data_loaders(
-        X_train, y_train, X_val, y_val, batch_size=args.batch_size
-    )
+    # 获取训练标签用于计算类别权重
+    all_labels = []
+    for _, label in train_subset:
+        all_labels.append(label.numpy())
+    train_labels = np.concatenate(all_labels)
 
     # 设置训练器
     logger.info("设置训练器")
     trainer = setup_trainer(
         model=model,
-        train_labels=y_train,
+        train_labels=train_labels,  # 使用收集的标签
         device=device,
         lr=args.learning_rate,
         weight_decay=args.weight_decay
@@ -193,7 +216,7 @@ def train(args, logger):
 
     logger.info("训练完成")
 
-
+#先不用predict函数
 def predict(args, logger):
     """预测模式"""
     logger.info("启动预测模式")
