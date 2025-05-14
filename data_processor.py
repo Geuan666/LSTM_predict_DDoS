@@ -289,7 +289,7 @@ class DataProcessor:
         # 4. 特征降维 (根据需要应用PCA)
         # 只对预处理后的数值特征应用PCA
         if len(numeric_cols) > 10 and fit:  # 仅在特征数量足够多的情况下应用PCA
-            pca = PCA(n_components=0.95)  # 保留95%的方差信息
+            pca = PCA(n_components=32)  # 保留95%的方差信息
             pca_result = pca.fit_transform(df_processed[numeric_cols])
 
             # 保存PCA模型
