@@ -5,7 +5,7 @@
 export CUDA_VISIBLE_DEVICES=0
 
 # 定义基本参数
-DATA_PATH="data/train"
+DATA_PATH="C:\\Users\\17380\\Downloads\\CSV-\\03-11"
 OUTPUT_DIR="output"
 EPOCHS=50
 BATCH_SIZE=64

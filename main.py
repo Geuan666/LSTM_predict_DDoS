@@ -9,8 +9,6 @@ import json
 from datetime import datetime
 from typing import Dict, List
 from torch.utils.data import DataLoader, random_split
-
-from data_processor import DataProcessor
 from lstm_model import DDoSPredictionLSTM
 from trainer import DDoSModelTrainer, setup_trainer
 from utils import setup_logger, compute_node_attack_probability, set_seed
