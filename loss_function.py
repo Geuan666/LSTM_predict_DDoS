@@ -8,12 +8,9 @@ from typing import Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
-
 class WeightedBCELoss(nn.Module):
     """
     带权二元交叉熵损失函数
-
-    用于解决类别不平衡问题的损失函数，可单独设置正负样本权重
     """
 
     def __init__(self, pos_weight: float = None, neg_weight: float = None):

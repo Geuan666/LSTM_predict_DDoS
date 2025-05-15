@@ -17,6 +17,7 @@ from torch.utils.data import Dataset
 warnings.filterwarnings('ignore')
 logger = logging.getLogger(__name__)
 
+
 class DataProcessor:
     """
     数据处理类，负责加载、清洗、特征工程及阈值式序列构建
@@ -24,14 +25,14 @@ class DataProcessor:
 
     def __init__(self,
                  data_path: str,
-                 threshold_points: List[int] = [ 128, 256, 512],
+                 threshold_points: List[int] = [128, 256, 512],
                  window_size: int = 15,
                  step_size: int = 1,
                  n_workers: int = 4):
         """
         Args:
             data_path: 数据文件路径
-            threshold_points: 阈值点列表，默认[4, 8, 16, 32, 64, 128]
+            threshold_points: 阈值点列表，默认[128, 256, 512]
             window_size: 滑动窗口大小(秒)
             step_size: 滑动步长(秒)
             n_workers: 并行处理的工作进程数
@@ -41,80 +42,120 @@ class DataProcessor:
         self.window_size = window_size
         self.step_size = step_size
         self.n_workers = n_workers
+        self.column_map = None  # 用于存储列名映射
 
         # 存储各阈值点的特征提取器
         self.scalers = {}
         self.encoders = {}
         self.pca_models = {}
 
-        # 特征列表
-        base_features = [
+        # 不带空格版本的特征列表
+        self.base_features = [
             'Protocol',
-            'Flow Duration',
-            'Total Fwd Packets',
-            'Total Backward Packets',
-            'Flow Bytes/s',
-            'Flow Packets/s',
-            'Flow IAT Mean',
-            'Fwd Packet Length Max',
-            'Fwd Packet Length Min',
-            'Fwd Packet Length Mean',
-            'Fwd Packet Length Std',
-            'Bwd Packet Length Max',
-            'Bwd Packet Length Min',
-            'Bwd Packet Length Mean',
-            'Bwd Packet Length Std',
-            'Packet Length Variance',
-            'Flow IAT Min',
-            'Flow IAT Max',
-            'Flow IAT Mean',
-            'Flow IAT Std',
-            'Fwd IAT Mean',
-            'Fwd IAT Std',
-            'Fwd IAT Max',
-            'Fwd IAT Min',
-            'Bwd IAT Mean',
-            'Bwd IAT Std',
-            'Bwd IAT Max',
-            'Bwd IAT Min',
-            'Fwd PSH Flags',
-            'Bwd PSH Flags',
-            'Fwd URG Flags',
-            'Bwd URG Flags',
-            'Fwd Header Length',
-            'Bwd Header Length',
-            'Fwd Packets/s',
-            'Bwd Packets/s',
+            'FlowDuration',
+            'TotalFwdPackets',
+            'TotalBackwardPackets',
+            'FlowBytes/s',
+            'FlowPackets/s',
+            'FlowIATMean',
+            'FwdPacketLengthMax',
+            'FwdPacketLengthMin',
+            'FwdPacketLengthMean',
+            'FwdPacketLengthStd',
+            'BwdPacketLengthMax',
+            'BwdPacketLengthMin',
+            'BwdPacketLengthMean',
+            'BwdPacketLengthStd',
+            'PacketLengthVariance',
+            'FlowIATMin',
+            'FlowIATMax',
+            'FlowIATMean',
+            'FlowIATStd',
+            'FwdIATMean',
+            'FwdIATStd',
+            'FwdIATMax',
+            'FwdIATMin',
+            'BwdIATMean',
+            'BwdIATStd',
+            'BwdIATMax',
+            'BwdIATMin',
+            'FwdPSHFlags',
+            'BwdPSHFlags',
+            'FwdURGFlags',
+            'BwdURGFlags',
+            'FwdHeaderLength',
+            'BwdHeaderLength',
+            'FwdPackets/s',
+            'BwdPackets/s',
             'Init_Win_bytes_forward',
             'Init_Win_bytes_backward',
             'min_seg_size_forward',
-            'Subflow Fwd Bytes',
-            'Subflow Bwd Bytes',
-            'Average Packet Size',
-            'Avg Fwd Segment Size',
-            'Avg Bwd Segment Size',
-            'Active Mean',
-            'Active Min',
-            'Active Max',
-            'Active Std',
-            'Idle Mean',
-            'Idle Min',
-            'Idle Max',
-            'Idle Std'
+            'SubflowFwdBytes',
+            'SubflowBwdBytes',
+            'AveragePacketSize',
+            'AvgFwdSegmentSize',
+            'AvgBwdSegmentSize',
+            'ActiveMean',
+            'ActiveMin',
+            'ActiveMax',
+            'ActiveStd',
+            'IdleMean',
+            'IdleMin',
+            'IdleMax',
+            'IdleStd'
         ]
-
-        # 只使用带前导空格的特征名
-        self.selected_features = [' ' + feature for feature in base_features]
 
         # 需要进行对数转换的特征
-        base_log_features = [
-            'Flow Bytes/s', 'Flow Packets/s', 'Fwd Packets/s', 'Bwd Packets/s',
-            'Flow Duration', 'Packet Length Variance'
+        self.log_transform_features_base = [
+            'FlowBytes/s', 'FlowPackets/s', 'FwdPackets/s', 'BwdPackets/s',
+            'FlowDuration', 'PacketLengthVariance'
         ]
 
-        self.log_transform_features = [' ' + feature for feature in base_log_features]
+        # 类别特征
+        self.categorical_features_base = ['Protocol']
 
-        self.categorical_features = [' Protocol']
+        # 用于查找包数量列的不同可能名称
+        self.fwd_packets_cols_base = ['TotalFwdPackets', 'FwdPackets', 'ForwardPackets']
+        self.bwd_packets_cols_base = ['TotalBackwardPackets', 'BwdPackets', 'BackwardPackets']
+
+    def normalize_column_names(self, df: pd.DataFrame) -> Dict[str, str]:
+        """
+        创建标准化的列名映射
+        将所有列名无空格版本作为键，原始列名作为值
+
+        Args:
+            df: 输入的DataFrame
+
+        Returns:
+            无空格列名到原始列名的映射字典
+        """
+        column_map = {}
+        for col in df.columns:
+            # 移除所有空格后的列名作为键
+            normalized_key = col.replace(" ", "")
+            column_map[normalized_key] = col
+
+        # 打印映射信息
+        logger.info(f"创建了列名映射，共 {len(column_map)} 个列")
+        logger.debug(f"列名映射示例: {list(column_map.items())[:5]}...")
+
+        return column_map
+
+    def get_actual_column_name(self, normalized_name: str) -> Optional[str]:
+        """
+        根据标准化名称获取数据集中的实际列名
+
+        Args:
+            normalized_name
+
+        Returns:
+            实际列名，如果不存在则返回None
+        """
+        if self.column_map is None:
+            logger.warning("列名映射尚未初始化")
+            return None
+
+        return self.column_map.get(normalized_name)
 
     def load_data(self) -> pd.DataFrame:
         """加载CICDDoS2019数据集"""
@@ -140,13 +181,19 @@ class DataProcessor:
         else:
             df = self._load_single_file(self.data_path)
 
-        logger.info(f"数据加载完成，共 {len(df)} 条记录")
+        # 创建列名映射
+        self.column_map = self.normalize_column_names(df)
 
-        # 注意：不要清理列名中的空格，保留前导空格
-        logger.info(f"列名示例: {list(df.columns)[:10]}...")
+        # 检查关键特征列是否存在
+        found_features = [name for name in self.base_features if self.get_actual_column_name(name) is not None]
+        missing_features = [name for name in self.base_features if self.get_actual_column_name(name) is None]
+
+        logger.info(f"数据加载完成，共 {len(df)} 条记录")
+        logger.info(f"找到 {len(found_features)} 个特征列，缺失 {len(missing_features)} 个特征列")
+        if missing_features:
+            logger.warning(f"缺失的特征列: {missing_features[:10]}...")
 
         return df
-
 
     def _load_single_file(self, file_path: str) -> pd.DataFrame:
         """加载单个CSV文件"""
@@ -165,33 +212,13 @@ class DataProcessor:
                     logger.info(f"Excel读取失败，尝试CSV格式: {str(e)}")
                     pass
 
-                # 尝试读取表头确定可用列
+                # 直接尝试读取CSV文件，不筛选列
                 header_df = pd.read_csv(file_path, nrows=5)
-
-                # 找出可用列 - 使用带前导空格的列名
-                available_cols = [col for col in header_df.columns if col in self.selected_features]
-
-                # 添加标签列
-                for label_col in [' Label', ' label', 'Label', 'label']:
-                    if label_col in header_df.columns:
-                        available_cols.append(label_col)
-                        break
 
             except:
                 # 如果默认引擎失败，尝试Python引擎
                 logger.info(f"默认CSV引擎失败，尝试Python引擎")
                 header_df = pd.read_csv(file_path, nrows=5, engine='python')
-
-                # 找出可用列 - 使用带前导空格的列名
-                available_cols = [col for col in header_df.columns if col in self.selected_features]
-
-                # 添加标签列
-                for label_col in [' Label', ' label', 'Label', 'label']:
-                    if label_col in header_df.columns:
-                        available_cols.append(label_col)
-                        break
-
-            logger.info(f"找到 {len(available_cols)} 个可用列: {available_cols[:10]}...")
 
             # 对超大文件进行采样
             sample_rate = 1.0  # 默认不采样
@@ -208,7 +235,6 @@ class DataProcessor:
                 # 尝试使用C引擎，每次小批量读取
                 chunks = pd.read_csv(
                     file_path,
-                    usecols=available_cols,
                     chunksize=5000,  # 更小的块大小
                     on_bad_lines='skip'
                 )
@@ -217,7 +243,6 @@ class DataProcessor:
                 # 切换到Python引擎
                 chunks = pd.read_csv(
                     file_path,
-                    usecols=available_cols,
                     engine='python',
                     chunksize=5000,
                     on_bad_lines='skip'
@@ -225,21 +250,20 @@ class DataProcessor:
 
             # 处理数据块
             for chunk in chunks:
-                # 不清理列名中的空格，保留前导空格
-
                 # 采样处理
                 if sample_rate < 1.0:
                     chunk = chunk.sample(frac=sample_rate)
 
-                # 处理标签
-                for label_col in [' Label', ' label', 'Label', 'label']:
-                    if label_col in chunk.columns:
-                        chunk[label_col] = chunk[label_col].apply(
+                # 处理标签 - 使用标准化列名查找
+                # 检查不同可能的标签列名
+                for label_col_base in ['Label', 'label']:
+                    # 创建该块数据的临时列名映射
+                    temp_map = {col.replace(" ", ""): col for col in chunk.columns}
+                    if label_col_base in temp_map:
+                        actual_label_col = temp_map[label_col_base]
+                        chunk[actual_label_col] = chunk[actual_label_col].apply(
                             lambda x: 0 if str(x).lower() in ['benign', 'normal'] else 1
                         )
-                        # 确保标签列名统一为' Label'（带前导空格）
-                        if label_col != ' Label':
-                            chunk.rename(columns={label_col: ' Label'}, inplace=True)
                         break
 
                 chunk_list.append(chunk)
@@ -278,6 +302,11 @@ class DataProcessor:
         df_clean = df.drop_duplicates()
         logger.info(f"移除重复记录后剩余 {len(df_clean)} 条记录")
 
+        # 获取标签列名
+        label_col = self.get_actual_column_name('Label')
+        if not label_col and self.get_actual_column_name('label'):
+            label_col = self.get_actual_column_name('label')
+
         # 2. 处理缺失值
         # 对数值特征使用中位数填充
         numeric_cols = df_clean.select_dtypes(include=['number']).columns
@@ -286,12 +315,12 @@ class DataProcessor:
         # 对分类特征使用众数填充
         cat_cols = df_clean.select_dtypes(include=['object']).columns
         for col in cat_cols:
-            if col != ' Label':  # 不处理标签列 - 使用带前导空格的标签列名
+            if col != label_col:  # 不处理标签列
                 df_clean[col] = df_clean[col].fillna(df_clean[col].mode()[0])
 
         # 3. 异常值处理（使用IQR方法）
         for col in numeric_cols:
-            if col != ' Label':  # 不处理标签列 - 使用带前导空格的标签列名
+            if col != label_col:  # 不处理标签列
                 Q1 = df_clean[col].quantile(0.25)
                 Q3 = df_clean[col].quantile(0.75)
                 IQR = Q3 - Q1
@@ -320,42 +349,50 @@ class DataProcessor:
         df_processed = df.copy()
 
         # 1. 对长尾分布特征进行对数转换: X' = log(1 + X)
-        for col in self.log_transform_features:
-            if col in df_processed.columns:
-                # 确保值为正
-                min_val = df_processed[col].min()
+        for base_col in self.log_transform_features_base:
+            actual_col = self.get_actual_column_name(base_col)
+            if actual_col and actual_col in df_processed.columns:
+                min_val = df_processed[actual_col].min()
                 if min_val < 0:
-                    df_processed[col] = df_processed[col] - min_val + 1
-                df_processed[col] = np.log1p(df_processed[col])
+                    df_processed[actual_col] = df_processed[actual_col] - min_val + 1
+                df_processed[actual_col] = np.log1p(df_processed[actual_col])
 
         # 2. 处理类别特征（独热编码）
-        for col in self.categorical_features:
-            if col in df_processed.columns:
+        for base_col in self.categorical_features_base:
+            actual_col = self.get_actual_column_name(base_col)
+            if actual_col and actual_col in df_processed.columns:
+
+                # --------- ⛑ 防止重复 one-hot 编码 ⛑ ---------
+                already_encoded = any(
+                    col.startswith(f"{base_col}_") for col in df_processed.columns
+                )
+                if already_encoded:
+                    logger.info(f"检测到特征 {base_col} 已经完成独热编码，跳过")
+                    continue
+                # -----------------------------------------
+
                 if fit:
                     encoder = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
-                    encoded_data = encoder.fit_transform(df_processed[[col]])
-                    self.encoders[col] = encoder
+                    encoded_data = encoder.fit_transform(df_processed[[actual_col]])
+                    self.encoders[base_col] = encoder
                 else:
-                    encoder = self.encoders.get(col)
+                    encoder = self.encoders.get(base_col)
                     if encoder is None:
-                        logger.warning(f"找不到特征 {col} 的编码器，跳过处理")
+                        logger.warning(f"找不到特征 {base_col} 的编码器，跳过处理")
                         continue
-                    encoded_data = encoder.transform(df_processed[[col]])
+                    encoded_data = encoder.transform(df_processed[[actual_col]])
 
-                # 创建编码后的列
-                encoded_cols = [f"{col}_{cat}" for cat in encoder.categories_[0]]
+                encoded_cols = [f"{base_col}_{cat}" for cat in encoder.categories_[0]]
                 encoded_df = pd.DataFrame(encoded_data, columns=encoded_cols, index=df_processed.index)
 
-                # 删除原始类别列并添加编码后的列
-                df_processed = df_processed.drop(col, axis=1)
+                df_processed = df_processed.drop(actual_col, axis=1)
                 df_processed = pd.concat([df_processed, encoded_df], axis=1)
 
         # 3. 标准化数值特征
         numeric_cols = df_processed.select_dtypes(include=['number']).columns.tolist()
-
-        # 排除标签列
-        if ' Label' in numeric_cols:
-            numeric_cols.remove(' Label')
+        label_col = self.get_actual_column_name('Label')
+        if label_col and label_col in numeric_cols:
+            numeric_cols.remove(label_col)
 
         if numeric_cols:
             if fit:
@@ -367,23 +404,13 @@ class DataProcessor:
                 if scaler is not None:
                     df_processed[numeric_cols] = scaler.transform(df_processed[numeric_cols])
 
-        # 4. 特征降维 (根据需要应用PCA)
-        # 只对预处理后的数值特征应用PCA
-        if len(numeric_cols) > 10 and fit:  # 仅在特征数量足够多的情况下应用PCA
-            pca = PCA(n_components=32)  # 保留32个主成分
+        # 4. 特征降维（PCA）
+        if len(numeric_cols) > 10 and fit:
+            pca = PCA(n_components=32)
             pca_result = pca.fit_transform(df_processed[numeric_cols])
-
-            # 保存PCA模型
             self.pca_models['global'] = pca
-
-            # 创建PCA特征DataFrame
-            pca_df = pd.DataFrame(
-                pca_result,
-                columns=[f'PCA_{i}' for i in range(pca_result.shape[1])],
-                index=df_processed.index
-            )
-
-            # 替换原始特征
+            pca_df = pd.DataFrame(pca_result, columns=[f'PCA_{i}' for i in range(pca_result.shape[1])],
+                                  index=df_processed.index)
             df_processed = df_processed.drop(numeric_cols, axis=1)
             df_processed = pd.concat([df_processed, pca_df], axis=1)
 
@@ -391,19 +418,13 @@ class DataProcessor:
             pca = self.pca_models.get('global')
             if pca is not None:
                 pca_result = pca.transform(df_processed[numeric_cols])
-
-                # 创建PCA特征DataFrame
-                pca_df = pd.DataFrame(
-                    pca_result,
-                    columns=[f'PCA_{i}' for i in range(pca_result.shape[1])],
-                    index=df_processed.index
-                )
-
-                # 替换原始特征
+                pca_df = pd.DataFrame(pca_result, columns=[f'PCA_{i}' for i in range(pca_result.shape[1])],
+                                      index=df_processed.index)
                 df_processed = df_processed.drop(numeric_cols, axis=1)
                 df_processed = pd.concat([df_processed, pca_df], axis=1)
 
         logger.info("特征预处理完成")
+        logger.info(f"预处理后特征列数量: {df_processed.shape[1]}")
         return df_processed
 
     def construct_threshold_sequences(self, df: pd.DataFrame) -> Dict[int, np.ndarray]:
@@ -421,28 +442,26 @@ class DataProcessor:
         logger.info("开始构建阈值式序列")
 
         # 确保数据按时间戳排序
-        if ' Timestamp' in df.columns:
-            df = df.sort_values(by=' Timestamp')
-        elif 'Timestamp' in df.columns:
-            df = df.sort_values(by='Timestamp')
+        timestamp_col = self.get_actual_column_name('Timestamp')
+        if timestamp_col and timestamp_col in df.columns:
+            df = df.sort_values(by=timestamp_col)
 
         # 存储各阈值点的特征序列
         threshold_sequences = {}
 
-        # 获取总包数列（前向+后向）- 使用带前导空格的列名
-        fwd_packets_cols = [' Total Fwd Packets', ' Fwd Packets', ' Forward Packets']
-        bwd_packets_cols = [' Total Backward Packets', ' Bwd Packets', ' Backward Packets']
-
+        # 查找前向包数列和后向包数列
         fwd_col = None
-        for col in fwd_packets_cols:
-            if col in df.columns:
-                fwd_col = col
+        for base_col in self.fwd_packets_cols_base:
+            actual_col = self.get_actual_column_name(base_col)
+            if actual_col and actual_col in df.columns:
+                fwd_col = actual_col
                 break
 
         bwd_col = None
-        for col in bwd_packets_cols:
-            if col in df.columns:
-                bwd_col = col
+        for base_col in self.bwd_packets_cols_base:
+            actual_col = self.get_actual_column_name(base_col)
+            if actual_col and actual_col in df.columns:
+                bwd_col = actual_col
                 break
 
         if fwd_col is not None and bwd_col is not None:
@@ -453,12 +472,16 @@ class DataProcessor:
             logger.warning(f"找不到标准包数量列，尝试备选方案")
 
             # 尝试使用Flow Bytes/s作为替代指标
-            if ' Flow Bytes/s' in df.columns:
+            flow_bytes_col = self.get_actual_column_name('FlowBytes/s')
+            flow_duration_col = self.get_actual_column_name('FlowDuration')
+            flow_packets_col = self.get_actual_column_name('FlowPackets/s')
+
+            if flow_bytes_col and flow_bytes_col in df.columns:
                 logger.info("使用Flow Bytes/s作为替代指标")
-                df['TotalPackets'] = df[' Flow Bytes/s'] / 100  # 假设的转换因子
-            elif ' Flow Packets/s' in df.columns and ' Flow Duration' in df.columns:
+                df['TotalPackets'] = df[flow_bytes_col] / 100  # 假设的转换因子
+            elif flow_packets_col and flow_duration_col and flow_packets_col in df.columns and flow_duration_col in df.columns:
                 logger.info("使用Flow Packets/s作为替代指标")
-                df['TotalPackets'] = df[' Flow Packets/s'] * df[' Flow Duration'] / 1000000  # 估计总包数
+                df['TotalPackets'] = df[flow_packets_col] * df[flow_duration_col] / 1000000  # 估计总包数
             else:
                 # 最后的方案：简单地使用均匀分割
                 logger.warning("无法找到合适的包数量列，使用均匀分割数据")
@@ -467,19 +490,13 @@ class DataProcessor:
 
         # 获取特征列和标签列
         feature_cols = df.columns.tolist()
-        if ' Label' in feature_cols:
-            feature_cols.remove(' Label')
-        elif 'Label' in feature_cols:
-            feature_cols.remove('Label')
-        if ' Timestamp' in feature_cols:
-            feature_cols.remove(' Timestamp')
-        elif 'Timestamp' in feature_cols:
-            feature_cols.remove('Timestamp')
+        label_col = self.get_actual_column_name('Label')
+        if label_col and label_col in feature_cols:
+            feature_cols.remove(label_col)
+        if timestamp_col and timestamp_col in feature_cols:
+            feature_cols.remove(timestamp_col)
         if 'TotalPackets' in feature_cols:
             feature_cols.remove('TotalPackets')
-
-        # 标签列，如果存在
-        label_col = ' Label' if ' Label' in df.columns else 'Label' if 'Label' in df.columns else None
 
         # 处理各阈值点 - 修改为串行处理而不是使用multiprocessing
         for threshold in self.threshold_points:
@@ -524,15 +541,15 @@ class DataProcessor:
 
         # 提取标签（如果有）
         y = None
-        if label_col is not None:
+        if label_col is not None and label_col in valid_df.columns:
             y = valid_df[label_col].values
 
         # 组合特征和标签
         if y is not None:
-            logger.info(f"阈值点 {threshold}: 提取了 {len(X)} 条记录")
+            logger.info(f"阈值点 {threshold}: 提取了 {len(X)} 条记录数据,shape: {X.shape}")
             return np.hstack((X, y.reshape(-1, 1)))
         else:
-            logger.info(f"阈值点 {threshold}: 提取了 {len(X)} 条记录（无标签）")
+            logger.info(f"阈值点 {threshold}: 提取了 {len(X)} 条记录（无标签）,shape: {X.shape}")
             return X
 
     def create_sliding_windows(self,
@@ -712,7 +729,7 @@ class DDoSDataset(Dataset):
 
     def __init__(self,
                  data_path: str,
-                 threshold_points: List[int] = [ 128, 256, 512],
+                 threshold_points: List[int] = [128, 256, 512],
                  window_size: int = 15,
                  step_size: int = 1,
                  preprocessor_path: Optional[str] = None,
@@ -786,7 +803,7 @@ if __name__ == "__main__":
     data_path = "C:\\Users\\17380\\Downloads\\CSV-\\03-11"
     processor = DataProcessor(
         data_path=data_path,
-        threshold_points=[ 128, 256, 512],
+        threshold_points=[128, 256, 512],
         window_size=15,
         step_size=1,
         n_workers=4
@@ -805,7 +822,7 @@ if __name__ == "__main__":
     try:
         dataset = DDoSDataset(
             data_path=data_path,
-            threshold_points=[ 128, 256, 512],
+            threshold_points=[128, 256, 512],
             window_size=15,
             step_size=1,
             train=True
