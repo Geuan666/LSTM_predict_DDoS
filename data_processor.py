@@ -25,14 +25,14 @@ class DataProcessor:
 
     def __init__(self,
                  data_path: str,
-                 threshold_points: List[int] = [128, 256, 512],
+                 threshold_points: List[int] = [64, 128, 256, 512, 1024],
                  window_size: int = 15,
                  step_size: int = 1,
                  n_workers: int = 4):
         """
         Args:
             data_path: 数据文件路径
-            threshold_points: 阈值点列表，默认[128, 256, 512]
+            threshold_points: 阈值点列表，默认[64, 128, 256, 512, 1024]
             window_size: 滑动窗口大小(秒)
             step_size: 滑动步长(秒)
             n_workers: 并行处理的工作进程数
@@ -102,7 +102,8 @@ class DataProcessor:
             'IdleMean',
             'IdleMin',
             'IdleMax',
-            'IdleStd'
+            'IdleStd',
+            'Timestamp',
         ]
 
         # 需要进行对数转换的特征
@@ -157,134 +158,128 @@ class DataProcessor:
 
         return self.column_map.get(normalized_name)
 
+    def _load_single_file(self, file_path: str) -> pd.DataFrame:
+        """加载单个 CSV 文件，只读取base_features中的列和标签列"""
+        try:
+            logger.info(f"开始读取文件: {os.path.basename(file_path)}")
+
+            # 先读取文件头，获取列名
+            try:
+                header_df = pd.read_csv(file_path, nrows=0)
+            except Exception as e:
+                logger.warning(f"默认引擎读取头部失败: {e}，切换 Python 引擎")
+                header_df = pd.read_csv(file_path, nrows=0, engine='python')
+
+            # 先创建临时列名映射，用于识别需要的列
+            temp_column_map = {}
+            for col in header_df.columns:
+                normalized_key = col.replace(" ", "")
+                temp_column_map[normalized_key] = col
+
+            # 确定要读取的列名
+            usecols = []
+
+            # 添加特征列
+            for base_col in self.base_features:
+                if base_col in temp_column_map:
+                    usecols.append(temp_column_map[base_col])
+
+            # 添加标签列
+            label_col = None
+            for label_name in ['Label', 'label']:
+                if label_name in temp_column_map:
+                    label_col = temp_column_map[label_name]
+                    usecols.append(label_col)
+                    break
+
+            if not label_col:
+                # 尝试其他方式找标签列
+                for col in header_df.columns:
+                    if 'label' in col.lower():
+                        usecols.append(col)
+                        logger.info(f"使用替代标签列: {col}")
+                        break
+
+            if not usecols:
+                logger.error(f"无法识别需要读取的列")
+                return pd.DataFrame()
+
+            logger.info(f"将读取 {len(usecols)} 列: {len(usecols) - 1} 个特征列和 1 个标签列")
+
+            # 设置采样率
+            sample_rate = 0.1 if os.path.basename(file_path) in ['LDAP.csv', 'UDP.csv', 'Syn.csv'] else 1.0
+            if sample_rate < 1.0:
+                logger.info(f"对大文件采样 {sample_rate}")
+
+            # 分块读取，只读需要的列
+            chunks = None
+            try:
+                chunks = pd.read_csv(file_path, chunksize=1000, usecols=usecols, on_bad_lines='skip')
+            except Exception as e:
+                logger.warning(f"C 引擎读取失败: {e}，切换 Python 引擎")
+                chunks = pd.read_csv(file_path, engine='python', chunksize=1000, usecols=usecols, on_bad_lines='skip')
+
+            chunk_list = []
+            for chunk in chunks:
+                if sample_rate < 1.0:
+                    chunk = chunk.sample(frac=sample_rate)
+                chunk_list.append(chunk)
+
+            if not chunk_list:
+                return pd.DataFrame()
+
+            df = pd.concat(chunk_list, ignore_index=True)
+            logger.info(f"文件 {os.path.basename(file_path)} 读取完成，shape={df.shape}")
+
+            # 确认列数
+            expected_col_count = len(self.base_features) + 1
+            if df.shape[1] != expected_col_count:
+                logger.warning(f"列数与预期不符: 得到 {df.shape[1]}，预期 {expected_col_count}")
+                logger.info(f"当前 DataFrame 列名列表: {df.columns.tolist()}")
+            return df
+
+        except Exception as e:
+            logger.error(f"加载文件 {file_path} 时出错: {e}")
+            return pd.DataFrame()
+
     def load_data(self) -> pd.DataFrame:
-        """加载CICDDoS2019数据集"""
+        """加载CICDDoS2019数据集，保证按行拼接并只读取所需的列"""
         logger.info(f"加载数据集: {self.data_path}")
 
-        # 支持多文件加载
+        df_list = []
         if os.path.isdir(self.data_path):
-            all_files = [os.path.join(self.data_path, f) for f in os.listdir(self.data_path)
-                         if f.endswith('.csv') and not f.startswith('.')]
-
-            # 顺序加载文件（不使用多进程）
-            df_list = []
+            all_files = [
+                os.path.join(self.data_path, f)
+                for f in os.listdir(self.data_path)
+                if f.endswith('.csv') and not f.startswith('.')
+            ]
             for file in all_files:
-                df = self._load_single_file(file)
-                if not df.empty:
-                    df_list.append(df)
-
-            # 合并所有数据
-            if df_list:
-                df = pd.concat(df_list, ignore_index=True)
-            else:
-                df = pd.DataFrame()
+                df_part = self._load_single_file(file)
+                if not df_part.empty:
+                    # 打印每块的 shape，方便调试
+                    logger.debug(f"{os.path.basename(file)} shape = {df_part.shape}")
+                    df_list.append(df_part)
         else:
-            df = self._load_single_file(self.data_path)
+            df_list.append(self._load_single_file(self.data_path))
+
+        if not df_list:
+            return pd.DataFrame()
+
+        # 确保按行拼接（axis=0）
+        df = pd.concat(df_list, ignore_index=True)
+
+        # 拼完再检查：行数一定要大于列数，否则就是搞反了
+        if df.shape[0] < df.shape[1]:
+            logger.error(
+                f"拼接后行数 ({df.shape[0]}) 少于列数 ({df.shape[1]})，请检查单个文件是否读成了转置矩阵"
+            )
+            raise ValueError("数据行列方向错误，已停止执行")
 
         # 创建列名映射
         self.column_map = self.normalize_column_names(df)
 
-        # 检查关键特征列是否存在
-        found_features = [name for name in self.base_features if self.get_actual_column_name(name) is not None]
-        missing_features = [name for name in self.base_features if self.get_actual_column_name(name) is None]
-
-        logger.info(f"数据加载完成，共 {len(df)} 条记录")
-        logger.info(f"找到 {len(found_features)} 个特征列，缺失 {len(missing_features)} 个特征列")
-        if missing_features:
-            logger.warning(f"缺失的特征列: {missing_features[:10]}...")
-
+        logger.info(f"数据加载完成，最终shape: {df.shape}")
         return df
-
-    def _load_single_file(self, file_path: str) -> pd.DataFrame:
-        """加载单个CSV文件"""
-        try:
-            logger.info(f"开始读取文件: {os.path.basename(file_path)}")
-
-            # 尝试不同的读取方式
-            try:
-                # 尝试作为Excel文件读取
-                logger.info(f"尝试以Excel格式读取: {os.path.basename(file_path)}")
-                try:
-                    df = pd.read_excel(file_path, engine='openpyxl')
-                    logger.info(f"成功以Excel格式读取文件")
-                    return df
-                except Exception as e:
-                    logger.info(f"Excel读取失败，尝试CSV格式: {str(e)}")
-                    pass
-
-                # 直接尝试读取CSV文件，不筛选列
-                header_df = pd.read_csv(file_path, nrows=5)
-
-            except:
-                # 如果默认引擎失败，尝试Python引擎
-                logger.info(f"默认CSV引擎失败，尝试Python引擎")
-                header_df = pd.read_csv(file_path, nrows=5, engine='python')
-
-            # 对超大文件进行采样
-            sample_rate = 1.0  # 默认不采样
-            if os.path.basename(file_path) in ['LDAP.csv', 'UDP.csv']:
-                sample_rate = 0.1  # 只处理10%的数据
-                logger.info(f"对大文件进行采样处理: {os.path.basename(file_path)}，采样率: {sample_rate}")
-
-            # 分块读取文件
-            chunk_list = []
-            total_rows = 0
-
-            # 尝试使用C引擎，出错则切换到Python引擎
-            try:
-                # 尝试使用C引擎，每次小批量读取
-                chunks = pd.read_csv(
-                    file_path,
-                    chunksize=5000,  # 更小的块大小
-                    on_bad_lines='skip'
-                )
-            except Exception as e:
-                logger.warning(f"C引擎读取失败: {str(e)}，切换到Python引擎")
-                # 切换到Python引擎
-                chunks = pd.read_csv(
-                    file_path,
-                    engine='python',
-                    chunksize=5000,
-                    on_bad_lines='skip'
-                )
-
-            # 处理数据块
-            for chunk in chunks:
-                # 采样处理
-                if sample_rate < 1.0:
-                    chunk = chunk.sample(frac=sample_rate)
-
-                # 处理标签 - 使用标准化列名查找
-                # 检查不同可能的标签列名
-                for label_col_base in ['Label', 'label']:
-                    # 创建该块数据的临时列名映射
-                    temp_map = {col.replace(" ", ""): col for col in chunk.columns}
-                    if label_col_base in temp_map:
-                        actual_label_col = temp_map[label_col_base]
-                        chunk[actual_label_col] = chunk[actual_label_col].apply(
-                            lambda x: 0 if str(x).lower() in ['benign', 'normal'] else 1
-                        )
-                        break
-
-                chunk_list.append(chunk)
-                total_rows += len(chunk)
-
-                # 显示进度
-                if total_rows % 100000 == 0:
-                    logger.info(f"已读取 {total_rows} 行数据从 {os.path.basename(file_path)}")
-
-            # 合并所有块
-            if chunk_list:
-                df = pd.concat(chunk_list, ignore_index=True)
-                logger.info(f"文件 {os.path.basename(file_path)} 读取完成，总计 {len(df)} 行")
-                return df
-            else:
-                logger.warning(f"文件 {file_path} 没有读取到有效数据")
-                return pd.DataFrame()
-
-        except Exception as e:
-            logger.error(f"加载文件 {file_path} 时出错: {str(e)}")
-            return pd.DataFrame()
 
     def clean_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -445,6 +440,7 @@ class DataProcessor:
         timestamp_col = self.get_actual_column_name('Timestamp')
         if timestamp_col and timestamp_col in df.columns:
             df = df.sort_values(by=timestamp_col)
+            print(f"successful sort time stamp!")
 
         # 存储各阈值点的特征序列
         threshold_sequences = {}
@@ -729,7 +725,7 @@ class DDoSDataset(Dataset):
 
     def __init__(self,
                  data_path: str,
-                 threshold_points: List[int] = [128, 256, 512],
+                 threshold_points: List[int] = [64, 128, 256, 512, 1024],
                  window_size: int = 15,
                  step_size: int = 1,
                  preprocessor_path: Optional[str] = None,
@@ -803,7 +799,7 @@ if __name__ == "__main__":
     data_path = "C:\\Users\\17380\\Downloads\\CSV-\\03-11"
     processor = DataProcessor(
         data_path=data_path,
-        threshold_points=[128, 256, 512],
+        threshold_points=[64, 128, 256, 512, 1024],
         window_size=15,
         step_size=1,
         n_workers=4
@@ -822,7 +818,7 @@ if __name__ == "__main__":
     try:
         dataset = DDoSDataset(
             data_path=data_path,
-            threshold_points=[128, 256, 512],
+            threshold_points=[64, 128, 256, 512, 1024],
             window_size=15,
             step_size=1,
             train=True
