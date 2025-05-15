@@ -38,7 +38,7 @@ python main.py \
     --num_layers 2 \
     --dropout 0.3 \
     --attention_heads 4 \
-    --threshold_points "4,8,16,32,64,128" \
+    --threshold_points " 128, 256, 512" \
     --window_size 15 \
     --step_size 1 \
     --n_workers 4 \
