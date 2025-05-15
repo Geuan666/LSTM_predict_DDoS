@@ -57,7 +57,6 @@ class DataProcessor:
             'TotalBackwardPackets',
             'FlowBytes/s',
             'FlowPackets/s',
-            'FlowIATMean',
             'FwdPacketLengthMax',
             'FwdPacketLengthMin',
             'FwdPacketLengthMean',
@@ -207,7 +206,7 @@ class DataProcessor:
             logger.info(f"将读取 {len(usecols)} 列: {len(usecols) - 1} 个特征列和 1 个标签列")
 
             # 设置采样率
-            sample_rate = 0.1 if os.path.basename(file_path) in ['LDAP.csv', 'UDP.csv', 'Syn.csv'] else 1.0
+            sample_rate = 0.05 if os.path.basename(file_path) in ['LDAP.csv', 'UDP.csv', 'Syn.csv', 'UDPLag.csv', 'MSSQL.csv', 'NetBIOS.csv', 'Portmap.csv'] else 1.0
             if sample_rate < 1.0:
                 logger.info(f"对大文件采样 {sample_rate}")
 
@@ -228,7 +227,7 @@ class DataProcessor:
             if not chunk_list:
                 return pd.DataFrame()
 
-            df = pd.concat(chunk_list, ignore_index=True)
+            df = pd.concat(chunk_list, ignore_index=False)
             logger.info(f"文件 {os.path.basename(file_path)} 读取完成，shape={df.shape}")
 
             # 确认列数
@@ -281,6 +280,13 @@ class DataProcessor:
         logger.info(f"数据加载完成，最终shape: {df.shape}")
         return df
 
+    def dropna_in_chunks(self, df, chunk_size=1_000_00):
+        chunks = []
+        for i in range(0, len(df), chunk_size):
+            chunk = df.iloc[i:i + chunk_size].dropna()
+            chunks.append(chunk)
+        return pd.concat(chunks, ignore_index=True)
+
     def clean_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         数据清洗
@@ -295,19 +301,18 @@ class DataProcessor:
 
         # 1. 移除重复记录
         df_clean = df.drop_duplicates()
-        logger.info(f"移除重复记录后剩余 {len(df_clean)} 条记录")
+        logger.info(f"移除重复记录后剩余 {len(df_clean)} 条记录,df_clean.shape={df_clean.shape}")
+        after_dedup = len(df_clean)
 
         # 获取标签列名
         label_col = self.get_actual_column_name('Label')
-        if not label_col and self.get_actual_column_name('label'):
-            label_col = self.get_actual_column_name('label')
 
         # 2. 处理缺失值
-        # 对数值特征使用中位数填充
-        numeric_cols = df_clean.select_dtypes(include=['number']).columns
-        df_clean[numeric_cols] = df_clean[numeric_cols].fillna(df_clean[numeric_cols].median())
+        df_clean = self.dropna_in_chunks(df_clean)
+        logger.info(f"删除缺失值后剩余 {len(df_clean)} 条记录 (删除了 {after_dedup - len(df_clean)} 条)")
 
         # 对分类特征使用众数填充
+        numeric_cols = df_clean.select_dtypes(include=['number']).columns
         cat_cols = df_clean.select_dtypes(include=['object']).columns
         for col in cat_cols:
             if col != label_col:  # 不处理标签列
@@ -324,7 +329,6 @@ class DataProcessor:
 
                 # 将异常值限制在边界范围内
                 df_clean[col] = df_clean[col].clip(lower_bound, upper_bound)
-
         logger.info("数据清洗完成")
         return df_clean
 
@@ -399,25 +403,6 @@ class DataProcessor:
                 if scaler is not None:
                     df_processed[numeric_cols] = scaler.transform(df_processed[numeric_cols])
 
-        # 4. 特征降维（PCA）
-        if len(numeric_cols) > 10 and fit:
-            pca = PCA(n_components=32)
-            pca_result = pca.fit_transform(df_processed[numeric_cols])
-            self.pca_models['global'] = pca
-            pca_df = pd.DataFrame(pca_result, columns=[f'PCA_{i}' for i in range(pca_result.shape[1])],
-                                  index=df_processed.index)
-            df_processed = df_processed.drop(numeric_cols, axis=1)
-            df_processed = pd.concat([df_processed, pca_df], axis=1)
-
-        elif len(numeric_cols) > 10 and not fit:
-            pca = self.pca_models.get('global')
-            if pca is not None:
-                pca_result = pca.transform(df_processed[numeric_cols])
-                pca_df = pd.DataFrame(pca_result, columns=[f'PCA_{i}' for i in range(pca_result.shape[1])],
-                                      index=df_processed.index)
-                df_processed = df_processed.drop(numeric_cols, axis=1)
-                df_processed = pd.concat([df_processed, pca_df], axis=1)
-
         logger.info("特征预处理完成")
         logger.info(f"预处理后特征列数量: {df_processed.shape[1]}")
         return df_processed
@@ -451,6 +436,7 @@ class DataProcessor:
             actual_col = self.get_actual_column_name(base_col)
             if actual_col and actual_col in df.columns:
                 fwd_col = actual_col
+                print(f"fwd_col: {fwd_col}")
                 break
 
         bwd_col = None
@@ -458,6 +444,7 @@ class DataProcessor:
             actual_col = self.get_actual_column_name(base_col)
             if actual_col and actual_col in df.columns:
                 bwd_col = actual_col
+                print(f"bwd_col: {bwd_col}")
                 break
 
         if fwd_col is not None and bwd_col is not None:

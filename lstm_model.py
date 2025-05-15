@@ -145,7 +145,6 @@ class MultiHeadAttention(nn.Module):
 
         return output
 
-
 class DDoSPredictionLSTM(nn.Module):
     """
     基于双向LSTM和自注意力机制的DDoS攻击预测模型
